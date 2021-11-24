@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 // Unix sockets
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -42,8 +43,18 @@ int main(int argc, char* argv[])
    printf("Connecting with : %i\n", sockfd);
 
    char message[] = "uname -a";
+   char buffer[1024];
 
    int write_size = write(sockfd, message, sizeof(message));
+   
+   int read_bytes;
+   while(read_bytes = read(sockfd, buffer, sizeof(buffer) - 1))
+   {
+      printf("CLIENT SIDE read_bytes %i", read_bytes);
+      buffer[read_bytes] = '\0';
+      printf("CLIENT SIDE : %s \n", buffer);
+      //sched_yield();
+   }
 
    printf("Client exiting.");
 }

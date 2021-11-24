@@ -1,5 +1,3 @@
-// C++ (maybe gets removed)
-#include <memory>
 // Stdlib
 #include <stddef.h>
 #include <stdio.h>
@@ -9,136 +7,30 @@
 #include <unistd.h>
 #include <sched.h>
 #include <getopt.h>
+#include <fcntl.h>
 // Unix sockets
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+// Pthreads
+#include <pthread.h>
+
+#define USE_SPLICE
 
 /**
- *
+ * Some global settings and variables. These should mainly be used by the master thread.
  **/
 struct {
    const char* program;
    const char* socket;
    int         verbose;
+   int         num_threads;
+   pthread_t*  threads;
 } global;
 
-
 /**
- *
- **/
-int fork_exec(char* argv[])
-{
-   int status = 0;
-   pid_t pid;
-
-   if( (pid = fork()) < 0 )
-   {
-      status = -1;
-   }
-   else if(!pid) 
-   {
-      // make call
-      if(execvp(argv[0], argv) == -1)
-      {
-         // error handling
-         printf(" could not start process ");
-      }
-   } 
-   else 
-   {
-      // Loop over waitpid to wait for child
-      while(waitpid(pid, &status, 0) < 0)
-      {
-         if(errno != EINTR)
-         {
-            status = -1;
-            break;
-         }
-         
-         sched_yield();
-      }
-   }
-
-   return status;
-}
-
-/**
- * Make a named local socket.
- **/
-int make_named_socket (const char *filename)
-{
-   struct sockaddr_un name;
-   int sock;
-   size_t size;
-
-   /* Create the socket. */
-   sock = socket (AF_LOCAL, SOCK_STREAM, 0);
-   if (sock < 0)
-   {
-      perror ("socket");
-      exit (EXIT_FAILURE);
-   }
-
-   /* Bind a name to the socket. */
-   name.sun_family = AF_LOCAL;
-   strncpy (name.sun_path, filename, sizeof (name.sun_path));
-   name.sun_path[sizeof (name.sun_path) - 1] = '\0';
-   
-   if (bind (sock, (struct sockaddr *) &name, SUN_LEN(&name)) < 0)
-   {
-      perror ("bind");
-      exit (EXIT_FAILURE);
-   }
-   
-   /* Return socket */
-   return sock;
-}
-
-/**
- *
- **/
-int handle_connection(int sockfd)
-{
-   #define buffer_capacity 1024
-   char buffer[buffer_capacity];
-   int read_bytes;
-
-   while((read_bytes = read(sockfd, buffer, buffer_capacity)))
-   {
-      /* Create argv for exec() from buffer */
-      char* cptr = buffer;
-      char* pch  = strchr(cptr, ' ');
-      int count = strlen(cptr) != 0 ? 2 : 1;
-      while (pch != NULL)
-      {
-         pch = strchr(pch + 1, ' ');
-         ++count;
-      }
-      
-      std::unique_ptr<char*[]> argv{new char*[count]};
-      argv[0] = cptr;
-      argv[count - 1] = nullptr;
-      count = 1;
-      pch  = strchr(cptr, ' ');
-      while (pch != NULL)
-      {
-         *pch = '\0';
-         argv[count] = pch + 1;
-         pch = strchr(pch + 1, ' ');
-         ++count;
-      }
-      
-      /* Call fork()+exec() */
-      if(fork_exec(argv.get()) != 0)
-      {
-         printf("Could not fork()+exec()");
-      }
-   }
-}
-
-/**
- *
+ * Print usage help message.
+ * Will exit the program.
  **/
 void print_usage (FILE* stream, int exit_code)
 {
@@ -151,7 +43,8 @@ void print_usage (FILE* stream, int exit_code)
 }
 
 /**
- *
+ * Parse command line options.
+ * Called on master thread.
  **/
 int parse_command_line(int argc, char* argv[])
 {
@@ -167,6 +60,7 @@ int parse_command_line(int argc, char* argv[])
             We distinguish them by their indices. */
          {"help",    no_argument,       0, 'h'},
          {"socket",  required_argument, 0, 's'},
+         {"num-threads", required_argument, 0, 'n'},
          {0, 0, 0, 0}
       };
 
@@ -199,6 +93,11 @@ int parse_command_line(int argc, char* argv[])
             printf ("option -s with value `%s'\n", optarg);
             global.socket = optarg;
             break;
+         
+         case 'n':
+            printf ("option -s with value `%s'\n", optarg);
+            global.num_threads = strtol(optarg, NULL, 0);
+            break;
 
          case '?':
             /* getopt_long already printed an error message. */
@@ -228,14 +127,230 @@ int parse_command_line(int argc, char* argv[])
 }
 
 /**
+ * Make a named local socket.
+ *
+ * Called on master thread to create a local UNIX socket,
+ * which clients can connect to with requests.
+ **/
+int make_named_socket (const char *filename)
+{
+   struct sockaddr_un name;
+   int sock;
+   size_t size;
+
+   /* Create the socket. */
+   sock = socket (AF_LOCAL, SOCK_STREAM, 0);
+   if (sock < 0)
+   {
+      perror ("socket");
+      exit (EXIT_FAILURE);
+   }
+
+   /* Bind a name to the socket. */
+   name.sun_family = AF_LOCAL;
+   strncpy (name.sun_path, filename, sizeof (name.sun_path));
+   name.sun_path[sizeof (name.sun_path) - 1] = '\0';
+   
+   if (bind (sock, (struct sockaddr *) &name, SUN_LEN(&name)) < 0)
+   {
+      perror ("bind");
+      exit (EXIT_FAILURE);
+   }
+   
+   /* Return socket */
+   return sock;
+}
+
+
+/**
+ * 
+ **/
+int fork_exec(char** argv, int sockfd)
+{
+   int status = 0;
+   pid_t pid;
+   
+   int pipes[1][2];
+                   
+   // pipes for parent to write and read
+   int pip0 = pipe(pipes[0]);
+
+   if( (pid = fork()) < 0 )
+   {
+      status = -1;
+   }
+   else if(!pid) 
+   {
+      /* Make stdout print to write pipe */
+      if(dup2(pipes[0][1], fileno(stdout)) == -1)
+      {
+         printf(" CHILD_READ_FD DUP ERROR ");
+         abort();
+      }
+      
+      /* Close pipes as child process should not know of these */
+      close(pipes[0][0]);
+      close(pipes[0][1]);
+
+      // CHDIR
+      //if(!dir.empty())
+      //{
+      //   if(chdir(dir.c_str()) == -1)
+      //   {
+      //      midas::stream::HeaderInserter err_buf(std::cerr.rdbuf(),"*** ",true);
+      //      std::ostream err(&err_buf);
+      //      err << "COULD NOT CHDIR\n"
+      //          << dir 
+      //          << std::flush;
+      //   }
+      //}
+
+      // make call
+      if(execvp(argv[0], argv) == -1)
+      {
+         // error handling
+         printf(" could not start process ");
+      }
+
+      /* Make sure childs always exit if execvp fails */
+      _Exit(1); /* We use "_Exit" as it will not interfere with parents atexit handlers */
+   } 
+   else 
+   {
+      close(pipes[0][1]); /* Close child write pipe, such that it is not kept alive by parent 
+                           * as this would mean the splice (read/write) loop would run forever
+                           */
+
+      char buffer[1024];
+      int read_bytes;
+      
+      /* Transfer output to client */
+#ifdef USE_SPLICE
+      /* Using splice function will do it in kernel space, which is more optimal,
+       * but splice is only present in newer kernels 
+       */
+      while(read_bytes = splice(pipes[0][0], NULL, sockfd, NULL, 1024 - 1, 0))
+      {
+         printf("Read bytes %i\n", read_bytes);
+      }
+#else
+      /* Fallback to read/write loop if splice is not available */
+      while(read_bytes = read(pipes[0][0], buffer, 1024))
+      {
+         printf("Read bytes %i\n", read_bytes);
+         write(sockfd, buffer, read_bytes);
+      }
+#endif /* USE_SPLICE */
+      
+      close(pipes[0][0]);
+
+      /* Loop over waitpid to wait for child */
+      while(waitpid(pid, &status, 0) < 0)
+      {
+         if(errno != EINTR)
+         {
+            status = -1;
+            break;
+         }
+         
+         sched_yield();
+      }
+   }
+
+   return status;
+}
+
+
+/**
+ *
+ **/
+int handle_connection(int sockfd)
+{
+   #define buffer_capacity 1024
+   char buffer[buffer_capacity];
+   int read_bytes;
+
+   if(read_bytes = read(sockfd, buffer, buffer_capacity) != buffer_capacity)
+   {
+      /* Create argv for exec() from buffer */
+      char* cptr = buffer;
+      char* pch  = strchr(cptr, ' ');
+      int count = strlen(cptr) != 0 ? 2 : 1;
+      while (pch != NULL)
+      {
+         pch = strchr(pch + 1, ' ');
+         ++count;
+      }
+      
+      char** argv = (char**) malloc(sizeof(char**) * count);
+      argv[0] = cptr;
+      argv[count - 1] = nullptr;
+      count = 1;
+      pch  = strchr(cptr, ' ');
+      while (pch != NULL)
+      {
+         *pch = '\0';
+         argv[count] = pch + 1;
+         pch = strchr(pch + 1, ' ');
+         ++count;
+      }
+      
+      /* Call fork()+exec() */
+      if(fork_exec(argv, sockfd) != 0)
+      {
+         printf("Could not fork()+exec()");
+      }
+
+      free(argv);
+   }
+   else
+   {
+      printf("Command could not fit in buffer");
+   }
+}
+
+
+/**
+ *
+ **/
+void listen_on_socket(int sockfd)
+{
+   socklen_t clilen;
+   struct sockaddr_un cliaddr;
+	int connfd;
+
+   while(true)
+   {
+      clilen = sizeof(cliaddr);
+      connfd = accept(sockfd, (sockaddr*) &cliaddr, &clilen);
+
+      printf("Connection accepted: %i\n", connfd);
+      handle_connection(connfd);
+
+      close(connfd);
+   }
+}
+
+/**
+ *
+ **/
+void* pthread_listen_on_socket(void* arg)
+{
+   listen_on_socket(* (int*) arg);
+   return NULL;
+}
+
+/**
  *
  **/
 int main(int argc, char* argv[])
 {
    /* Input processing */
-   global.program = argv[0];
-   global.socket  = NULL;
-   global.verbose = 0;
+   global.program     = argv[0];
+   global.socket      = NULL;
+   global.verbose     = 0;
+   global.num_threads = 1;
+   global.threads     = NULL;
 
    if(parse_command_line(argc, argv) != 0)
    {
@@ -250,31 +365,31 @@ int main(int argc, char* argv[])
    
    /* Create local socket for listening */
    unlink(global.socket); /* Will remove the local socket/fd/file if it exists */
-   int sock = make_named_socket(global.socket);
+   int sockfd = make_named_socket(global.socket);
    
-   if(listen(sock, 1024) != 0) /* 1024 connections allowed */
+   if(listen(sockfd, 1024) != 0) /* 1024 connections allowed */
    {
       perror("Could not listen on socket.");
       exit(EXIT_FAILURE);
    }
    
-   /* Listen on socket and handle any requests */
-   socklen_t clilen;
-   struct sockaddr_un cliaddr;
-	int connfd;
+   /* Create threads listening on socket which will handle any requests */
+   global.threads = (pthread_t*)malloc(global.num_threads * sizeof(pthread_t));
 
-   while(true)
+   for(int i = 0; i < global.num_threads; ++i)
    {
-      clilen = sizeof(cliaddr);
-      connfd = accept(sock, (sockaddr*) &cliaddr, &clilen);
+      pthread_create(&global.threads[i], NULL, pthread_listen_on_socket, (void *) &sockfd);
+   }
 
-      printf("Connection accepted: %i\n", connfd);
-      handle_connection(connfd);
-
-      close(connfd);
+   for(int i = 0; i < global.num_threads; ++i)
+   {
+      pthread_join(global.threads[i], NULL);
    }
    
    /* Clean-up */
-   close(sock);
+   free(global.threads);
+   close(sockfd);
    unlink(global.socket); /* Clean up the local socket/fd/file */
+
+   return EXIT_SUCCESS;
 }

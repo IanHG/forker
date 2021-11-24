@@ -6,7 +6,7 @@ CXX=g++
 all: forker.x client.x
 
 forker.x: forker.o
-	$(CXX) -o $@ $^ $(CFLAGS)
+	$(CXX) -o $@ $^ $(CFLAGS) -pthread
 
 client.x: client.o
 	$(CXX) -o $@ $^ $(CFLAGS)
