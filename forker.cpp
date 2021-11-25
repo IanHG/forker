@@ -16,6 +16,10 @@
 // Pthreads
 #include <pthread.h>
 
+/**
+ * Use "splice()" function. If splice is not available, comment this out,
+ * and program will use a read/write loop instead.
+ **/
 #define USE_SPLICE
 
 /**
