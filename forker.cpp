@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <signal.h>
 // Unix sockets
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -26,6 +27,7 @@ struct {
    int         verbose;
    int         num_threads;
    pthread_t*  threads;
+   sigset_t    sigset;
 } global;
 
 /**
@@ -35,6 +37,11 @@ struct {
 void print_usage (FILE* stream, int exit_code)
 {
   fprintf (stream, "Usage:  %s [options ...]\n", global.program);
+  fprintf (stream, "\n"
+                   "  Sending USR1 signal to a running %s, will cause a safe shutdown.\n"
+                   "\n"
+                 , global.program 
+          );
   fprintf (stream,
            "  -h  --help              Display this usage information.\n"
            "  -s  --socket <filename> Socket to use for communication.\n"
@@ -45,13 +52,17 @@ void print_usage (FILE* stream, int exit_code)
 /**
  * Parse command line options.
  * Called on master thread.
+ *
+ * Based on this example:
+ *    https://www.gnu.org/software/libc/manual/html_node/Getopt-Long-Option-Example.html
  **/
 int parse_command_line(int argc, char* argv[])
 {
    int c;
-
+   
    while (1)
    {
+      /* Define command-line options to be parsed with getopt_long */
       static struct option long_options[] =
       {
          /* These options set a flag. */
@@ -122,7 +133,7 @@ int parse_command_line(int argc, char* argv[])
          printf ("%s ", argv[optind++]);
       putchar ('\n');
    }
-
+   
    return 0;
 }
 
@@ -163,7 +174,13 @@ int make_named_socket (const char *filename)
 
 
 /**
- * 
+ * Handle fork() + exec(), for an argv array, and
+ * an optional directory, dir, to run in.
+ *
+ * Will send all output from the exec'ed program back on 
+ * the socket defined by sockfd.
+ * This can be done with "splice" (by defining USE_SPLICE macro),
+ * or a basic "read/write" loop, if "splice is not available.
  **/
 int fork_exec(char** argv, char* dir, int sockfd)
 {
@@ -185,7 +202,7 @@ int fork_exec(char** argv, char* dir, int sockfd)
       if(dup2(pipes[0][1], fileno(stdout)) == -1)
       {
          printf(" CHILD_READ_FD DUP ERROR ");
-         abort();
+         _Exit(1); /* We use "_Exit" as it will not interfere with parents atexit handlers */
       }
       
       /* Close pipes as child process should not know of these */
@@ -198,6 +215,7 @@ int fork_exec(char** argv, char* dir, int sockfd)
          if(chdir(dir) == -1)
          {
             printf("Could not chdir\n");
+            _Exit(1); /* We use "_Exit" as it will not interfere with parents atexit handlers */
          }
       }
 
@@ -258,7 +276,10 @@ int fork_exec(char** argv, char* dir, int sockfd)
 
 
 /**
- *
+ * Handle a connection. 
+ * 
+ * Will read the command and directory sent from the client,
+ * do some preparation and call fork_exec, which will handle fork() + exec().
  **/
 int handle_connection(int sockfd)
 {
@@ -301,6 +322,7 @@ int handle_connection(int sockfd)
       if(fork_exec(argv, dir, sockfd) != 0)
       {
          printf("Could not fork()+exec()\n");
+         status = -1;
       }
       
       /* Clean-up */
@@ -316,37 +338,82 @@ int handle_connection(int sockfd)
 
 
 /**
+ * Listen on a listen socket, and handle connections.
  *
+ * Will check the socket for any connections, 
+ * handle the connection, and close the connection again.
+ * 
+ * Called on each thread after the master thread has 
+ * opened the socket and set it up for listening.
  **/
 void listen_on_socket(int sockfd)
 {
    socklen_t clilen;
    struct sockaddr_un cliaddr;
 	int connfd;
-
+   
+   /* Listening loop */
    while(true)
    {
+      /* Accept connection */
       clilen = sizeof(cliaddr);
       connfd = accept(sockfd, (sockaddr*) &cliaddr, &clilen);
-
-      printf("Connection accepted: %i\n", connfd);
+   
+      /* Check for shutdown */
+      if ( connfd < 0 )
+      {
+         if( errno == EINVAL )
+         {
+            break;
+         }
+      }
+      
+      /* Handle connection */
       int status = handle_connection(connfd);
-
       close(connfd);
    }
 }
 
 /**
- *
+ * Listen on socket wrapper function for creating Posix-threads.
  **/
 void* pthread_listen_on_socket(void* arg)
 {
+   /* Call actual listening function */
    listen_on_socket(* (int*) arg);
+
    return NULL;
 }
 
 /**
+ * Handle SIGUSR1 on master thread.
  *
+ * When signal is caught, master thread will
+ * shutdown the UNIX socket, which will make all 
+ * threads exit, and cause the program to safely shut down
+ * in a clean way.
+ **/
+int handle_signal(int sockfd)
+{
+   int s, sig;
+   
+   /* Wait for SIGUSR1 */
+   s = sigwait(&global.sigset, &sig);
+   if (s != 0)
+   {
+      return 1;
+   }
+   
+   /* When SIGUSR1 is sent, shutdown listening socket.
+    * This will make threads exit as well 
+    */
+   shutdown(sockfd, SHUT_RDWR);
+
+   return 0;
+}
+
+/**
+ * Main of forker program.
  **/
 int main(int argc, char* argv[])
 {
@@ -356,26 +423,39 @@ int main(int argc, char* argv[])
    global.verbose     = 0;
    global.num_threads = 1;
    global.threads     = NULL;
-
+   
+   /* Parse command-line */
    if(parse_command_line(argc, argv) != 0)
    {
-      printf("Could not parse command line.\n");
+      perror("Could not parse command line.\n");
       return EXIT_FAILURE;
    }
    if(!global.socket)
    {
-      printf("No socket name provided.\n");
+      perror("No socket name provided.\n");
       return EXIT_FAILURE;
    }
    
+   /* Block SIGUSR1 on ALL threads (including master)
+    * This signal will be handled by master in a special function
+    */
+   sigemptyset (&global.sigset);
+   sigaddset   (&global.sigset, SIGUSR1);
+   int s;
+   if((s = pthread_sigmask(SIG_BLOCK, &global.sigset, NULL)) != 0)
+   {
+      perror("Could not mask out SIGUSR1.\n");
+      return EXIT_FAILURE;
+   }
+
    /* Create local socket for listening */
    unlink(global.socket); /* Will remove the local socket/fd/file if it exists */
    int sockfd = make_named_socket(global.socket);
    
    if(listen(sockfd, 1024) != 0) /* 1024 connections allowed */
    {
-      perror("Could not listen on socket.");
-      exit(EXIT_FAILURE);
+      perror("Could not listen on created UNIX socket.\n");
+      return EXIT_FAILURE;
    }
    
    /* Create threads listening on socket which will handle any requests */
@@ -384,6 +464,11 @@ int main(int argc, char* argv[])
    for(int i = 0; i < global.num_threads; ++i)
    {
       pthread_create(&global.threads[i], NULL, pthread_listen_on_socket, (void *) &sockfd);
+   }
+   
+   if(handle_signal(sockfd) != 0)
+   {
+      return EXIT_FAILURE;
    }
 
    for(int i = 0; i < global.num_threads; ++i)
