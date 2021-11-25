@@ -249,7 +249,7 @@ int fork_exec(char** argv, char* dir, int sockfd)
       /* Using splice function will do it in kernel space, which is more optimal,
        * but splice is only present in newer kernels 
        */
-      while(read_bytes = splice(pipes[0][0], NULL, sockfd, NULL, 1024 - 1, 0))
+      while((read_bytes = splice(pipes[0][0], NULL, sockfd, NULL, 1024 - 1, 0)))
       {
          if(global.verbose)
             printf("Read bytes %i\n", read_bytes);
@@ -298,7 +298,7 @@ int handle_connection(int sockfd)
    char buffer[buffer_capacity];
    int read_bytes;
 
-   if(read_bytes = read(sockfd, buffer, buffer_capacity) != buffer_capacity)
+   if((read_bytes = read(sockfd, buffer, buffer_capacity)) != buffer_capacity)
    {
       /* Get directory */
       int   cmd_len = strlen(buffer);
