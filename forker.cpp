@@ -251,13 +251,16 @@ int fork_exec(char** argv, char* dir, int sockfd)
        */
       while(read_bytes = splice(pipes[0][0], NULL, sockfd, NULL, 1024 - 1, 0))
       {
-         printf("Read bytes %i\n", read_bytes);
+         if(global.verbose)
+            printf("Read bytes %i\n", read_bytes);
       }
 #else
       /* Fallback to read/write loop if splice is not available */
       while(read_bytes = read(pipes[0][0], buffer, 1024))
       {
-         printf("Read bytes %i\n", read_bytes);
+         if(global.verbose)
+            printf("Read bytes %i\n", read_bytes);
+
          write(sockfd, buffer, read_bytes);
       }
 #endif /* USE_SPLICE */
