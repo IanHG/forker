@@ -49,7 +49,9 @@ void print_usage (FILE* stream, int exit_code)
   fprintf (stream,
            "  -h  --help              Display this usage information.\n"
            "  -s  --socket <filename> Socket to use for communication.\n"
-           "  -v  --verbose           Print verbose messages.\n");
+           "  -n  --num-threads       Number of threads for handling requests (default: 1).\n"
+           "  -v  --verbose           Print verbose messages.\n"
+           );
   exit (exit_code);
 }
 
