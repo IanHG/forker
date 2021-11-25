@@ -42,12 +42,12 @@ int main(int argc, char* argv[])
    
    printf("Connecting with : %i\n", sockfd);
 
-   char message[] = "uname -a";
-   char buffer[1024];
+   char message[] = "touch lol\0/home/ian/programming/cpp/forker/folder";
 
    int write_size = write(sockfd, message, sizeof(message));
    
-   int read_bytes;
+   char buffer[1024];
+   int  read_bytes;
    while(read_bytes = read(sockfd, buffer, sizeof(buffer) - 1))
    {
       printf("CLIENT SIDE read_bytes %i", read_bytes);

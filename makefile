@@ -1,4 +1,4 @@
-CXX=g++
+CXX=g++ -O3
 
 %.o: %.c
 	$(CXX) -c -o $@ $< $(CFLAGS)

@@ -165,7 +165,7 @@ int make_named_socket (const char *filename)
 /**
  * 
  **/
-int fork_exec(char** argv, int sockfd)
+int fork_exec(char** argv, char* dir, int sockfd)
 {
    int status = 0;
    pid_t pid;
@@ -192,24 +192,20 @@ int fork_exec(char** argv, int sockfd)
       close(pipes[0][0]);
       close(pipes[0][1]);
 
-      // CHDIR
-      //if(!dir.empty())
-      //{
-      //   if(chdir(dir.c_str()) == -1)
-      //   {
-      //      midas::stream::HeaderInserter err_buf(std::cerr.rdbuf(),"*** ",true);
-      //      std::ostream err(&err_buf);
-      //      err << "COULD NOT CHDIR\n"
-      //          << dir 
-      //          << std::flush;
-      //   }
-      //}
+      /* Change directory if requested */
+      if(dir)
+      {
+         if(chdir(dir) == -1)
+         {
+            printf("Could not chdir\n");
+         }
+      }
 
-      // make call
+      /* Make call */
       if(execvp(argv[0], argv) == -1)
       {
-         // error handling
-         printf(" could not start process ");
+         /* Call did not succeed */
+         printf("Could not start process\n");
       }
 
       /* Make sure childs always exit if execvp fails */
@@ -266,12 +262,18 @@ int fork_exec(char** argv, int sockfd)
  **/
 int handle_connection(int sockfd)
 {
+   int status = 0;
+
    #define buffer_capacity 1024
    char buffer[buffer_capacity];
    int read_bytes;
 
    if(read_bytes = read(sockfd, buffer, buffer_capacity) != buffer_capacity)
    {
+      /* Get directory */
+      int   cmd_len = strlen(buffer);
+      char* dir     = buffer + cmd_len + 1;
+
       /* Create argv for exec() from buffer */
       char* cptr = buffer;
       char* pch  = strchr(cptr, ' ');
@@ -296,17 +298,20 @@ int handle_connection(int sockfd)
       }
       
       /* Call fork()+exec() */
-      if(fork_exec(argv, sockfd) != 0)
+      if(fork_exec(argv, dir, sockfd) != 0)
       {
-         printf("Could not fork()+exec()");
+         printf("Could not fork()+exec()\n");
       }
-
+      
+      /* Clean-up */
       free(argv);
    }
    else
    {
-      printf("Command could not fit in buffer");
+      printf("Command could not fit in buffer\n");
    }
+
+   return status;
 }
 
 
@@ -325,7 +330,7 @@ void listen_on_socket(int sockfd)
       connfd = accept(sockfd, (sockaddr*) &cliaddr, &clilen);
 
       printf("Connection accepted: %i\n", connfd);
-      handle_connection(connfd);
+      int status = handle_connection(connfd);
 
       close(connfd);
    }
